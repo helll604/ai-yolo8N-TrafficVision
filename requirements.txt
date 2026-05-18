@@ -1,12 +1,16 @@
+# AI Detection
 ultralytics
-opencv-python
 torch
 torchvision
-torchaudio
+
+# Computer Vision
+opencv-python
 numpy
+
+# DeepSORT Tracking
 scipy
 filterpy
 lap
-matplotlib
-pandas
+
+# Configuration
 pyyaml
