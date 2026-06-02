@@ -3,28 +3,22 @@ import time
 import urllib.request
 import numpy as np
 
-from datetime import datetime
-from collections import defaultdict
 from ultralytics import YOLO
-
+from collections import defaultdict, deque
 
 # ================= CONFIG =================
 
-ESP32_URL = "http://10.224.54.178:81/stream"
+ESP32_URL = "http://10.211.187.178:81/stream"
+CAMERA_NAME = "ESP32CAM 1"
 
-WINDOW_NAME = "AI Traffic Vision"
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
 
-FRAME_WIDTH = 800
-FRAME_HEIGHT = 600
-
-LINE_Y = 320
-
+LINE_Y = 260
 FRAME_SKIP = 2
+CONFIDENCE = 0.35
 
-CONFIDENCE_THRESHOLD = 0.4
-
-MAX_BUFFER_SIZE = 50000
-
+# HANYA KENDARAAN
 VEHICLE_CLASSES = {
     2: "car",
     3: "motorcycle",
@@ -32,328 +26,191 @@ VEHICLE_CLASSES = {
     7: "truck"
 }
 
-
 # ================= TRACKER =================
 
-class VehicleTracker:
-
+class Tracker:
     def __init__(self):
-
-        self.track_memory = {}
-
-        self.counted_ids = set()
-
+        self.memory = {}
+        self.counted = set()
         self.counts = defaultdict(int)
 
-        self.id_counter = 0
+    def update(self, label, cx, cy):
+        key = f"{label}_{cx//30}_{cy//30}"
 
-        self.object_ids = {}
+        if key not in self.memory:
+            self.memory[key] = cy
+            return
 
-        self.last_seen = {}
+        prev = self.memory[key]
+        self.memory[key] = cy
 
-    def cleanup_memory(self):
-
-        current_time = time.time()
-
-        remove_keys = []
-
-        for key, t in self.last_seen.items():
-
-            if current_time - t > 5:
-                remove_keys.append(key)
-
-        for key in remove_keys:
-
-            self.last_seen.pop(key, None)
-
-            self.track_memory.pop(key, None)
-
-    def update(self, cls, cx, cy):
-
-        label = VEHICLE_CLASSES[cls]
-
-        grid_key = f"{label}_{cx//30}_{cy//30}"
-
-        if grid_key not in self.object_ids:
-
-            self.id_counter += 1
-
-            self.object_ids[grid_key] = self.id_counter
-
-        obj_id = self.object_ids[grid_key]
-
-        unique_id = f"{label}_{obj_id}"
-
-        self.last_seen[unique_id] = time.time()
-
-        if unique_id not in self.track_memory:
-
-            self.track_memory[unique_id] = cy
-
-            return False, obj_id
-
-        prev_y = self.track_memory[unique_id]
-
-        self.track_memory[unique_id] = cy
-
-        crossed = (
-            (prev_y < LINE_Y and cy >= LINE_Y) or
-            (prev_y > LINE_Y and cy <= LINE_Y)
-        )
-
-        if crossed and unique_id not in self.counted_ids:
-
-            self.counted_ids.add(unique_id)
-
+        if prev < LINE_Y <= cy and key not in self.counted:
+            self.counted.add(key)
             self.counts[label] += 1
 
-            return True, obj_id
+# ================= STREAM =================
 
-        return False, obj_id
+def connect_stream():
+    return urllib.request.urlopen(ESP32_URL, timeout=5)
 
+def get_frame(stream, buffer):
+    try:
+        buffer += stream.read(1024)
 
-# ================= OVERLAY =================
+        a = buffer.find(b'\xff\xd8')
+        b = buffer.find(b'\xff\xd9')
 
-def draw_overlay(frame, tracker, fps, latency):
+        if a != -1 and b != -1:
+            jpg = buffer[a:b+2]
+            buffer = buffer[b+2:]
 
-    cv2.rectangle(
-        frame,
-        (0, 0),
-        (340, 260),
-        (0, 0, 0),
-        -1
-    )
+            frame = cv2.imdecode(
+                np.frombuffer(jpg, dtype=np.uint8),
+                cv2.IMREAD_COLOR
+            )
 
-    info = [
-        f"FPS : {fps:.1f}",
-        f"Latency : {latency:.1f} ms",
-        "",
-        f"Total : {sum(tracker.counts.values())}",
-        f"Car : {tracker.counts.get('car', 0)}",
-        f"Motorcycle : {tracker.counts.get('motorcycle', 0)}",
-        f"Bus : {tracker.counts.get('bus', 0)}",
-        f"Truck : {tracker.counts.get('truck', 0)}"
-    ]
+            return frame, buffer
 
-    y = 30
+        return None, buffer
 
-    for text in info:
-
-        cv2.putText(
-            frame,
-            text,
-            (15, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 255),
-            2
-        )
-
-        y += 28
-
-    cv2.line(
-        frame,
-        (0, LINE_Y),
-        (FRAME_WIDTH, LINE_Y),
-        (0, 0, 255),
-        3
-    )
-
-    timestamp = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-    cv2.putText(
-        frame,
-        timestamp,
-        (500, 580),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
-    )
-
+    except:
+        return None, buffer
 
 # ================= MAIN =================
 
 def main():
 
-    print("Loading YOLOv8 Model...")
-
+    print("Loading YOLOv8...")
     model = YOLO("yolov8n.pt")
 
-    tracker = VehicleTracker()
+    tracker = Tracker()
 
+    fps_history = deque(maxlen=10)
     frame_id = 0
 
-    prev_time = time.time()
-
-    fps = 0
-
     while True:
-
         try:
+            print(f"Connecting to {CAMERA_NAME}...")
+            stream = connect_stream()
+            print("Connected OK!")
 
-            print("Connecting to ESP32 Camera...")
-
-            stream = urllib.request.urlopen(
-                ESP32_URL,
-                timeout=5
-            )
-
-            bytes_data = b''
-
-            print("Connected Successfully!\n")
+            buffer = b''
 
             while True:
 
-                bytes_data += stream.read(4096)
-
-                if len(bytes_data) > MAX_BUFFER_SIZE:
-                    bytes_data = bytes_data[-MAX_BUFFER_SIZE:]
-
-                a = bytes_data.find(b'\xff\xd8')
-                b = bytes_data.find(b'\xff\xd9')
-
-                if a == -1 or b == -1:
-                    continue
-
-                jpg = bytes_data[a:b+2]
-
-                bytes_data = bytes_data[b+2:]
-
-                frame = cv2.imdecode(
-                    np.frombuffer(jpg, dtype=np.uint8),
-                    cv2.IMREAD_COLOR
-                )
+                frame, buffer = get_frame(stream, buffer)
 
                 if frame is None:
                     continue
 
-                frame = cv2.resize(
-                    frame,
-                    (FRAME_WIDTH, FRAME_HEIGHT)
-                )
+                frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+
+                # 🔥 SHARPEN
+                frame = cv2.GaussianBlur(frame, (3,3), 0)
+                frame = cv2.addWeighted(frame, 1.5, frame, -0.5, 0)
 
                 frame_id += 1
-
                 if frame_id % FRAME_SKIP != 0:
                     continue
 
-                current_time = time.time()
-
-                fps = 1 / (current_time - prev_time)
-
-                prev_time = current_time
-
-                start_time = time.time()
+                start = time.time()
 
                 results = model(
                     frame,
+                    imgsz=640,
+                    conf=CONFIDENCE,
+                    iou=0.5,
                     verbose=False
                 )[0]
 
-                latency = (
-                    time.time() - start_time
-                ) * 1000
+                fps = 1 / (time.time() - start + 0.0001)
+                fps_history.append(fps)
+                smooth_fps = sum(fps_history) / len(fps_history)
 
+                # ================= LINE =================
+                cv2.line(frame, (0, LINE_Y), (FRAME_WIDTH, LINE_Y), (0, 0, 255), 2)
+
+                # ================= DETECTION =================
                 for box in results.boxes:
+
+                    conf = float(box.conf[0])
+                    if conf < CONFIDENCE:
+                        continue
 
                     cls = int(box.cls[0])
 
+                    # 🔥 FILTER: hanya kendaraan
                     if cls not in VEHICLE_CLASSES:
                         continue
 
-                    confidence = float(box.conf[0])
+                    label_name = VEHICLE_CLASSES[cls]
 
-                    if confidence < CONFIDENCE_THRESHOLD:
-                        continue
-
-                    x1, y1, x2, y2 = map(
-                        int,
-                        box.xyxy[0]
-                    )
-
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
                     cx = (x1 + x2) // 2
                     cy = (y1 + y2) // 2
 
-                    counted, obj_id = tracker.update(
-                        cls,
-                        cx,
-                        cy
-                    )
+                    tracker.update(label_name, cx, cy)
 
-                    label = VEHICLE_CLASSES[cls]
+                    # ================= BOX =================
+                    color = (0, 255, 0)
 
-                    color = (0, 165, 255)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2),
+                                  color, 2, cv2.LINE_AA)
 
-                    cv2.rectangle(
-                        frame,
-                        (x1, y1),
-                        (x2, y2),
-                        color,
-                        2
-                    )
+                    label = f"{label_name} {conf:.2f}"
 
-                    cv2.putText(
-                        frame,
-                        f"ID:{obj_id} {label}",
-                        (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
-                        2
-                    )
+                    (w, h), _ = cv2.getTextSize(label,
+                                                cv2.FONT_HERSHEY_SIMPLEX,
+                                                0.6, 2)
 
-                    cv2.circle(
-                        frame,
-                        (cx, cy),
-                        4,
-                        (0, 255, 0),
-                        -1
-                    )
+                    cv2.rectangle(frame,
+                                  (x1, y1 - h - 10),
+                                  (x1 + w, y1),
+                                  color, -1)
 
-                    if counted:
+                    cv2.putText(frame,
+                                label,
+                                (x1, y1 - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6,
+                                (0, 0, 0),
+                                2)
 
-                        print(
-                            f"[{datetime.now().strftime('%H:%M:%S')}] "
-                            f"{label.upper()} Counted"
-                        )
+                # ================= UI CLEAN =================
 
-                tracker.cleanup_memory()
+                total = sum(tracker.counts.values())
 
-                draw_overlay(
-                    frame,
-                    tracker,
-                    fps,
-                    latency
-                )
+                ui = [
+                    f"FPS : {smooth_fps:.1f}",
+                    f"Total : {total}",
+                    f"Car : {tracker.counts['car']}",
+                    f"Motor : {tracker.counts['motorcycle']}",
+                    f"Bus : {tracker.counts['bus']}",
+                    f"Truck : {tracker.counts['truck']}"
+                ]
 
-                cv2.imshow(
-                    WINDOW_NAME,
-                    frame
-                )
+                y = 30
+                for text in ui:
+                    cv2.putText(frame, text, (10, y),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7, (0,255,255), 2)
+                    y += 30
+
+                cv2.imshow("AI Traffic Vision", frame)
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
-
                     raise KeyboardInterrupt
 
         except KeyboardInterrupt:
-
-            print("\nSystem Stopped.")
-
+            print("SYSTEM STOPPED")
             break
 
         except Exception as e:
-
-            print("Connection Error:", e)
-
-            print("Reconnecting...\n")
-
+            print("ERROR:", e)
+            print("RECONNECTING...")
             time.sleep(2)
 
     cv2.destroyAllWindows()
-
 
 # ================= RUN =================
 
