@@ -1,218 +1,486 @@
 import cv2
 import time
+import threading
 import urllib.request
 import numpy as np
-
 from ultralytics import YOLO
 from collections import defaultdict, deque
+from datetime import datetime
 
-# ================= CONFIG =================
+# ─────────────────────────────────────────────
+#  KONFIGURASI — ubah di sini
+# ─────────────────────────────────────────────
+SOURCE_MODE   = "VIDEO"                    # "VIDEO" atau "ESP32-CAM"
+VIDEO_PATH    = "videos/traffic1.mp4"
+ESP32_URL     = "http://10.188.168.178:81/stream"
 
-ESP32_URL = "http://10.211.187.178:81/stream"
-CAMERA_NAME = "ESP32CAM 1"
+FRAME_WIDTH   = 800
+FRAME_HEIGHT  = 600
+LINE_Y        = 450   
+LINE_X        = 400 # vertikal ditengah                         # garis hitung kendaraan
 
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 480
+CONFIDENCE        = 0.20
+TRACKING_DISTANCE = 80
+MAX_TRACK_AGE     = 30
 
-LINE_Y = 260
-FRAME_SKIP = 2
-CONFIDENCE = 0.35
+# Warna bounding box per kelas (BGR)
+VEHICLE_COLORS = {
+    "car":        (0, 255, 0),
+    "motorcycle": (0, 255, 255),
+    "bus":        (255, 0, 0),
+    "truck":      (0, 165, 255),
+}
 
-# HANYA KENDARAAN
+# ID kelas YOLO → nama
 VEHICLE_CLASSES = {
     2: "car",
     3: "motorcycle",
     5: "bus",
-    7: "truck"
+    7: "truck",
 }
 
-# ================= TRACKER =================
 
-class Tracker:
+# ─────────────────────────────────────────────
+#  ESP32-CAM READER (thread terpisah)
+#  - Selalu ambil frame terbaru, buang yang lama
+#  - Tidak block main loop saat jaringan lambat
+# ─────────────────────────────────────────────
+class ESP32StreamReader:
+    def __init__(self, url: str):
+        self.url    = url
+        self._frame = None
+        self._lock  = threading.Lock()
+        self._stop  = threading.Event()
+        self._connected = False
+
+    def connect(self) -> bool:
+        try:
+            self._stream = urllib.request.urlopen(self.url, timeout=5)
+            self._connected = True
+            t = threading.Thread(target=self._read_loop, daemon=True)
+            t.start()
+            print(f"[ESP32] Terhubung: {self.url}")
+            return True
+        except Exception as e:
+            print(f"[ESP32] Gagal connect: {e}")
+            return False
+
+    def _read_loop(self):
+        buf = b""
+        while not self._stop.is_set():
+            try:
+                chunk = self._stream.read(16384)   # baca lebih besar → lebih lancar
+                if not chunk:
+                    break
+                buf += chunk
+
+                # Cari JPEG lengkap di buffer
+                while True:
+                    start = buf.find(b"\xff\xd8")
+                    end   = buf.find(b"\xff\xd9")
+                    if start == -1 or end == -1 or end <= start:
+                        break
+
+                    jpg = buf[start:end + 2]
+                    # Langsung buang semua data lama setelah frame ini
+                    # → efek "skip frame": selalu pakai frame terbaru
+                    buf = buf[end + 2:]
+
+                    frame = cv2.imdecode(
+                        np.frombuffer(jpg, dtype=np.uint8),
+                        cv2.IMREAD_COLOR,
+                    )
+                    if frame is not None:
+                        with self._lock:
+                            self._frame = frame   # simpan frame terbaru
+
+            except Exception:
+                break
+
+        self._connected = False
+
+    def read(self):
+        """Kembalikan frame terbaru. None jika belum ada."""
+        with self._lock:
+            if self._frame is None:
+                return None
+            frame = self._frame.copy()
+            self._frame = None   # reset agar caller tahu kapan ada frame baru
+            return frame
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def release(self):
+        self._stop.set()
+        try:
+            self._stream.close()
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────
+#  VIDEO SOURCE — wrapper VIDEO & ESP32
+# ─────────────────────────────────────────────
+class VideoSource:
+    def __init__(self, mode: str):
+        self.mode  = mode
+        self._cap   = None
+        self._esp32 = None
+
+    def connect(self) -> bool:
+        if self.mode == "VIDEO":
+            self._cap = cv2.VideoCapture(VIDEO_PATH)
+            if not self._cap.isOpened():
+                print(f"[VIDEO] Tidak bisa buka: {VIDEO_PATH}")
+                return False
+            # Kurangi buffer internal OpenCV agar tidak delay
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            print(f"[VIDEO] Loaded: {VIDEO_PATH}")
+            return True
+
+        elif self.mode == "ESP32-CAM":
+            self._esp32 = ESP32StreamReader(ESP32_URL)
+            return self._esp32.connect()
+
+        print(f"[SOURCE] Mode tidak dikenal: {self.mode} (gunakan 'VIDEO' atau 'ESP32-CAM')")
+        return False
+
+    def get_frame(self):
+        if self.mode == "VIDEO":
+            ret, frame = self._cap.read()
+            if not ret:
+                # Loop video dari awal
+                self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = self._cap.read()
+            return frame if ret else None
+
+        elif self.mode == "ESP32-CAM":
+            if not self._esp32.is_connected():
+                return None
+            return self._esp32.read()   # bisa None kalau belum ada frame baru
+
+        return None
+
+    def release(self):
+        if self._cap:
+            self._cap.release()
+        if self._esp32:
+            self._esp32.release()
+
+
+# ─────────────────────────────────────────────
+#  VEHICLE TRACKER
+# ─────────────────────────────────────────────
+class VehicleTracker:
     def __init__(self):
-        self.memory = {}
-        self.counted = set()
-        self.counts = defaultdict(int)
+        self.tracks          = {}
+        self.counted_ids     = set()
+        self.counts          = defaultdict(int)
+        self.crossing_events = []
+        self.next_id         = 0
+        self.frame_count     = 0
 
-    def update(self, label, cx, cy):
-        key = f"{label}_{cx//30}_{cy//30}"
+    # ── helpers ──────────────────────────────
+    def _new_id(self) -> int:
+        self.next_id += 1
+        return self.next_id
 
-        if key not in self.memory:
-            self.memory[key] = cy
+    def _find_match(self, cx: int, cy: int, label: str):
+        best_id   = None
+        best_dist = TRACKING_DISTANCE
+
+        for tid, track in self.tracks.items():
+            if track["crossed"] or track["label"] != label:
+                continue
+            if track["positions"]:
+                px, py = track["positions"][-1]
+                dist = np.hypot(px - cx, py - cy)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_id   = tid
+
+        return best_id
+
+    # ── public API ───────────────────────────
+    def update(self, label: str, cx: int, cy: int) -> bool:
+        tid = self._find_match(cx, cy, label)
+
+        if tid is None:
+            tid = self._new_id()
+            self.tracks[tid] = {
+                "id":        tid,
+                "label":     label,
+                "positions": deque(maxlen=30),
+                "crossed":   False,
+                "last_seen": self.frame_count,
+            }
+
+        track = self.tracks[tid]
+        track["last_seen"] = self.frame_count
+
+        crossed = False
+        if not track["crossed"] and track["positions"]:
+            prev_cx, prev_cy = track["positions"][-1]
+            if (prev_cy < LINE_Y <= cy) or (prev_cy > LINE_Y >= cy):
+                track["crossed"] = True
+                self.counted_ids.add(tid)
+                self.counts[label] += 1
+                crossed = True
+                self.crossing_events.append({
+                    "id":       tid,
+                    "label":    label,
+                    "time":     datetime.now(),
+                    "position": (cx, cy),
+                })
+                print(f"  [CROSSED] {label.upper()} | Total {self.counts[label]}")
+
+        track["positions"].append((cx, cy))
+        return crossed
+
+    def cleanup_old_tracks(self):
+        stale = [
+            tid for tid, t in self.tracks.items()
+            if not t["crossed"] and (self.frame_count - t["last_seen"]) > MAX_TRACK_AGE
+        ]
+        for tid in stale:
+            if tid not in self.counted_ids:
+                del self.tracks[tid]
+
+    def increment_frame(self):
+        self.frame_count += 1
+
+    def get_stats(self) -> dict:
+        total  = sum(self.counts.values())
+        active = sum(1 for t in self.tracks.values() if not t["crossed"])
+
+        rate = 0.0
+        if len(self.crossing_events) > 1:
+            t0  = self.crossing_events[0]["time"]
+            t1  = self.crossing_events[-1]["time"]
+            dur = (t1 - t0).total_seconds() / 60.0
+            rate = len(self.crossing_events) / max(dur, 1.0)
+        elif len(self.crossing_events) == 1:
+            rate = 1.0
+
+        return {
+            "total":       total,
+            "active":      active,
+            "per_vehicle": dict(self.counts),
+            "rate":        rate,
+        }
+
+    def reset(self):
+        self.__init__()
+        print("[TRACKER] Reset!")
+
+
+# ─────────────────────────────────────────────
+#  MAIN APP
+# ─────────────────────────────────────────────
+class TrafficVisionApp:
+    def __init__(self):
+        self.model       = None
+        self.tracker     = VehicleTracker()
+        self.source      = VideoSource(SOURCE_MODE)
+        self.fps_history = deque(maxlen=30)
+        self.running     = True
+
+        # Untuk mode ESP32: jangan paksa 30 fps, ikuti kecepatan stream
+        # Untuk mode VIDEO : bisa lebih tinggi
+        self._is_esp32 = (SOURCE_MODE == "ESP32-CAM")
+
+    # ── model ────────────────────────────────
+    def load_model(self):
+        print("Memuat model YOLOv8n …")
+        t0 = time.time()
+        self.model = YOLO("yolov8n.pt")
+        print(f"Model siap ({time.time() - t0:.1f} detik)")
+
+    # ── pemrosesan frame ─────────────────────
+    def process_frame(self, frame):
+        # Resize dulu
+        frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+
+        # Untuk ESP32: sedikit enhance kontras (opsional, ringan)
+        if self._is_esp32:
+            frame = cv2.convertScaleAbs(frame, alpha=1.1, beta=15)
+
+        t0 = time.time()
+        results = self.model(
+            frame,
+            imgsz=320,      # ← 320 jauh lebih cepat dari 640, cukup untuk deteksi
+            conf=CONFIDENCE,
+            iou=0.45,
+            verbose=False,
+        )[0]
+        inf_ms = (time.time() - t0) * 1000
+
+        fps = 1000.0 / inf_ms if inf_ms > 0 else 0
+        self.fps_history.append(fps)
+        return frame, results
+
+    # ── gambar ───────────────────────────────
+    def _draw_line(self, frame):
+        cv2.line(frame, (0, LINE_Y), (FRAME_WIDTH, LINE_Y), (0, 0, 255), 3)
+        return frame
+
+    def _draw_detections(self, frame, results):
+        if results is None or results.boxes is None:
+            return frame
+
+        for box in results.boxes:
+            conf = float(box.conf[0])
+            cls  = int(box.cls[0])
+            if conf < CONFIDENCE or cls not in VEHICLE_CLASSES:
+                continue
+
+            label = VEHICLE_CLASSES[cls]
+            color = VEHICLE_COLORS[label]
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+
+            crossed = self.tracker.update(label, cx, cy)
+
+            # Bounding box + titik tengah
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.circle(frame, (cx, cy), 4, color, -1)
+
+            # Label
+            text = f"{label.upper()} {conf:.2f}"
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 6, y1), color, -1)
+            cv2.putText(frame, text, (x1 + 3, y1 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+
+            # Notifikasi crossing
+            if crossed:
+                cv2.putText(frame, f"+1 {label.upper()}", (cx - 40, cy - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        return frame
+
+    def _draw_panel(self, frame):
+        stats   = self.tracker.get_stats()
+        avg_fps = sum(self.fps_history) / len(self.fps_history) if self.fps_history else 0
+
+        # Latar semi-transparan
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (285, 225), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
+        cv2.rectangle(frame, (0, 0), (285, 225), (200, 200, 200), 1)
+
+        def put(text, x, y, scale=0.55, color=(255, 255, 255), thick=1):
+            cv2.putText(frame, text, (x, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick)
+
+        put("TRAFFIC VISION", 15, 30, 0.7, (0, 255, 255), 2)
+
+        fps_color = (0, 255, 0) if avg_fps >= 20 else (0, 165, 255)
+        put(f"FPS: {avg_fps:.1f}", 15, 55, color=fps_color)
+        put(f"TOTAL: {stats['total']}", 15, 80, 0.65, (255, 255, 255), 2)
+
+        y = 105
+        for i, (key, label) in enumerate(zip(
+            ["car", "motorcycle", "bus", "truck"],
+            ["CAR", "MOTORCYCLE", "BUS", "TRUCK"],
+        )):
+            count = stats["per_vehicle"].get(key, 0)
+            pct   = (count / stats["total"] * 100) if stats["total"] > 0 else 0
+            put(f"{label}: {count} ({pct:.1f}%)", 15, y + i * 22)
+
+        put(f"ACTIVE: {stats['active']}",         15, y + 4 * 22)
+        put(f"RATE: {stats['rate']:.1f}/min",      15, y + 5 * 22, 0.5, (200, 200, 200))
+
+        # Label source mode
+        mode_label = f"SRC: {SOURCE_MODE}"
+        cv2.putText(frame, mode_label, (FRAME_WIDTH - 130, FRAME_HEIGHT - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+
+        return frame
+
+    def _print_stats(self):
+        s = self.tracker.get_stats()
+        now = datetime.now().strftime("%H:%M:%S")
+        print(f"\n[{now}] STATS — Total:{s['total']} "
+              f"Car:{s['per_vehicle'].get('car',0)} "
+              f"Truck:{s['per_vehicle'].get('truck',0)} "
+              f"Bus:{s['per_vehicle'].get('bus',0)} "
+              f"Moto:{s['per_vehicle'].get('motorcycle',0)} "
+              f"| Active:{s['active']} Rate:{s['rate']:.1f}/min")
+
+    # ── main loop ────────────────────────────
+    def run(self):
+        print("=" * 50)
+        print(" AI TRAFFIC VISION SYSTEM")
+        print(f" Mode  : {SOURCE_MODE}")
+        if SOURCE_MODE == "VIDEO":            print(f" File  : {VIDEO_PATH}")
+        else:
+            print(f" URL   : {ESP32_URL}")
+        print("=" * 50)
+
+        self.load_model()
+
+        if not self.source.connect():
+            print("[ERROR] Tidak bisa membuka sumber video!")
             return
 
-        prev = self.memory[key]
-        self.memory[key] = cy
+        print("Sistem SIAP | Q=Keluar  S=Statistik  R=Reset\n")
 
-        if prev < LINE_Y <= cy and key not in self.counted:
-            self.counted.add(key)
-            self.counts[label] += 1
+        last_stat_time = time.time()
+        no_frame_count = 0   # hitung berapa kali tidak dapat frame (ESP32)
 
-# ================= STREAM =================
+        while self.running:
+            frame = self.source.get_frame()
 
-def connect_stream():
-    return urllib.request.urlopen(ESP32_URL, timeout=5)
-
-def get_frame(stream, buffer):
-    try:
-        buffer += stream.read(1024)
-
-        a = buffer.find(b'\xff\xd8')
-        b = buffer.find(b'\xff\xd9')
-
-        if a != -1 and b != -1:
-            jpg = buffer[a:b+2]
-            buffer = buffer[b+2:]
-
-            frame = cv2.imdecode(
-                np.frombuffer(jpg, dtype=np.uint8),
-                cv2.IMREAD_COLOR
-            )
-
-            return frame, buffer
-
-        return None, buffer
-
-    except:
-        return None, buffer
-
-# ================= MAIN =================
-
-def main():
-
-    print("Loading YOLOv8...")
-    model = YOLO("yolov8n.pt")
-
-    tracker = Tracker()
-
-    fps_history = deque(maxlen=10)
-    frame_id = 0
-
-    while True:
-        try:
-            print(f"Connecting to {CAMERA_NAME}...")
-            stream = connect_stream()
-            print("Connected OK!")
-
-            buffer = b''
-
-            while True:
-
-                frame, buffer = get_frame(stream, buffer)
-
-                if frame is None:
+            # Untuk ESP32: kalau belum ada frame baru, tunggu sebentar
+            if frame is None:
+                if self._is_esp32:
+                    no_frame_count += 1
+                    if no_frame_count > 200:
+                        print("[ESP32] Tidak menerima frame, cek koneksi!")
+                        no_frame_count = 0
+                    time.sleep(0.01)
+                    continue
+                else:
                     continue
 
-                frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+            no_frame_count = 0
 
-                # 🔥 SHARPEN
-                frame = cv2.GaussianBlur(frame, (3,3), 0)
-                frame = cv2.addWeighted(frame, 1.5, frame, -0.5, 0)
+            # Proses
+            frame, results = self.process_frame(frame)
+            frame = self._draw_line(frame)
+            frame = self._draw_detections(frame, results)
+            frame = self._draw_panel(frame)
 
-                frame_id += 1
-                if frame_id % FRAME_SKIP != 0:
-                    continue
+            self.tracker.cleanup_old_tracks()
+            self.tracker.increment_frame()
 
-                start = time.time()
+            # Print statistik setiap 5 detik
+            if time.time() - last_stat_time >= 5:
+                self._print_stats()
+                last_stat_time = time.time()
 
-                results = model(
-                    frame,
-                    imgsz=640,
-                    conf=CONFIDENCE,
-                    iou=0.5,
-                    verbose=False
-                )[0]
+            cv2.imshow("AI Traffic Vision System", frame)
 
-                fps = 1 / (time.time() - start + 0.0001)
-                fps_history.append(fps)
-                smooth_fps = sum(fps_history) / len(fps_history)
+            # Delay: VIDEO pakai 1ms, ESP32 pakai 1ms juga (frame rate dikontrol stream)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                self.running = False
+            elif key == ord("s"):
+                self._print_stats()
+            elif key == ord("r"):
+                self.tracker.reset()
 
-                # ================= LINE =================
-                cv2.line(frame, (0, LINE_Y), (FRAME_WIDTH, LINE_Y), (0, 0, 255), 2)
+        # Bersih-bersih
+        self.source.release()
+        cv2.destroyAllWindows()
+        print("\nSistem dihentikan.")
+        self._print_stats()
 
-                # ================= DETECTION =================
-                for box in results.boxes:
 
-                    conf = float(box.conf[0])
-                    if conf < CONFIDENCE:
-                        continue
-
-                    cls = int(box.cls[0])
-
-                    # 🔥 FILTER: hanya kendaraan
-                    if cls not in VEHICLE_CLASSES:
-                        continue
-
-                    label_name = VEHICLE_CLASSES[cls]
-
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    cx = (x1 + x2) // 2
-                    cy = (y1 + y2) // 2
-
-                    tracker.update(label_name, cx, cy)
-
-                    # ================= BOX =================
-                    color = (0, 255, 0)
-
-                    cv2.rectangle(frame, (x1, y1), (x2, y2),
-                                  color, 2, cv2.LINE_AA)
-
-                    label = f"{label_name} {conf:.2f}"
-
-                    (w, h), _ = cv2.getTextSize(label,
-                                                cv2.FONT_HERSHEY_SIMPLEX,
-                                                0.6, 2)
-
-                    cv2.rectangle(frame,
-                                  (x1, y1 - h - 10),
-                                  (x1 + w, y1),
-                                  color, -1)
-
-                    cv2.putText(frame,
-                                label,
-                                (x1, y1 - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.6,
-                                (0, 0, 0),
-                                2)
-
-                # ================= UI CLEAN =================
-
-                total = sum(tracker.counts.values())
-
-                ui = [
-                    f"FPS : {smooth_fps:.1f}",
-                    f"Total : {total}",
-                    f"Car : {tracker.counts['car']}",
-                    f"Motor : {tracker.counts['motorcycle']}",
-                    f"Bus : {tracker.counts['bus']}",
-                    f"Truck : {tracker.counts['truck']}"
-                ]
-
-                y = 30
-                for text in ui:
-                    cv2.putText(frame, text, (10, y),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.7, (0,255,255), 2)
-                    y += 30
-
-                cv2.imshow("AI Traffic Vision", frame)
-
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    raise KeyboardInterrupt
-
-        except KeyboardInterrupt:
-            print("SYSTEM STOPPED")
-            break
-
-        except Exception as e:
-            print("ERROR:", e)
-            print("RECONNECTING...")
-            time.sleep(2)
-
-    cv2.destroyAllWindows()
-
-# ================= RUN =================
-
+# ─────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    app = TrafficVisionApp()
+    app.run()
