@@ -1,16 +1,16 @@
-# AI Detection
-ultralytics
+# ── AI Detection ──────────────────────────────
+ultralytics          # YOLOv8 (sudah include ByteTrack)
 torch
 torchvision
 
-# Computer Vision
+# ── Computer Vision ───────────────────────────
 opencv-python
 numpy
 
-# DeepSORT Tracking
-scipy
-filterpy
-lap
-
-# Configuration
+# ── Konfigurasi ───────────────────────────────
 pyyaml
+
+# ── CATATAN ───────────────────────────────────
+# filterpy, scipy, lap  DIHAPUS — paket DeepSORT yang tidak dipakai.
+# Kalau di masa depan ingin aktifkan DeepSORT, install kembali:
+#   pip install filterpy scipy lap

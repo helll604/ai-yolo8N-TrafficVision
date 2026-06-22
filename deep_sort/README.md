@@ -1,141 +1,144 @@
-# Deep SORT
+# AI Traffic Vision 🚦
 
-## Introduction
+Sistem monitoring lalu lintas berbasis AI menggunakan **YOLOv8n** untuk
+deteksi kendaraan realtime dari dua sumber: **file video** (kamera HP / CCTV)
+dan **streaming langsung ESP32-CAM**.
 
-This repository contains code for *Simple Online and Realtime Tracking with a Deep Association Metric* (Deep SORT).
-We extend the original [SORT](https://github.com/abewley/sort) algorithm to
-integrate appearance information based on a deep appearance descriptor.
-See the [arXiv preprint](https://arxiv.org/abs/1703.07402) for more information.
+---
 
-## Dependencies
+## Fitur
 
-The code is compatible with Python 2.7 and 3. The following dependencies are
-needed to run the tracker:
+- Deteksi 4 kelas kendaraan: **Car, Motorcycle, Bus, Truck**
+- Penghitungan otomatis saat kendaraan melewati garis ROI
+- Tracker kustom dengan matching berbasis jarak + kelas
+- Panel statistik realtime di layar (total, per-kelas, FPS, rate/menit)
+- Auto-reconnect saat koneksi ESP32-CAM terputus
+- Simpan report `.txt` otomatis saat program ditutup
+- Kontrol arah hitung: ke bawah / ke atas / dua arah
 
-* NumPy
-* sklearn
-* OpenCV
+---
 
-Additionally, feature generation requires TensorFlow (>= 1.0).
+## Arsitektur Sistem
 
-## Installation
-
-First, clone the repository:
 ```
-git clone https://github.com/nwojke/deep_sort.git
+[Sumber Video]
+  ESP32-CAM (MJPEG stream)  atau  File Video (.mp4 / .avi)
+        ↓
+  VideoSource.get_frame()
+        ↓
+  Resize + Enhance (ESP32)
+        ↓
+  YOLOv8n Inference  (imgsz=320, conf=0.35)
+        ↓
+  Filter kelas kendaraan  (car/motorcycle/bus/truck)
+        ↓
+  VehicleTracker.update()
+    ├─ Matching by distance + class label
+    ├─ Cek crossing ROI line
+    └─ Update counts & log
+        ↓
+  Draw: bounding box, panel, garis ROI
+        ↓
+  cv2.imshow()  +  tombol keyboard
+        ↓  (saat keluar)
+  Simpan report → outputs/reports/vehicle_report_YYYYMMDD_HHMMSS.txt
 ```
-Then, download pre-generated detections and the CNN checkpoint file from
-[here](https://drive.google.com/open?id=18fKzfqnqhqW3s9zwsCbnVJ5XF2JFeqMp).
 
-*NOTE:* The candidate object locations of our pre-generated detections are
-taken from the following paper:
+---
+
+## Instalasi
+
+```bash
+pip install -r requirements.txt
 ```
-F. Yu, W. Li, Q. Li, Y. Liu, X. Shi, J. Yan. POI: Multiple Object Tracking with
-High Performance Detection and Appearance Feature. In BMTT, SenseTime Group
-Limited, 2016.
+
+> Pastikan `yolov8n.pt` ada di folder yang sama dengan `vehicle_counting.py`.
+> Ultralytics akan otomatis download jika tidak ada.
+
+---
+
+## Konfigurasi (vehicle_counting.py)
+
+Semua pengaturan ada di bagian **KONFIGURASI** di atas file:
+
+| Parameter | Default | Keterangan |
+|-----------|---------|------------|
+| `SOURCE_MODE` | `"VIDEO"` | `"VIDEO"` atau `"ESP32-CAM"` |
+| `VIDEO_PATH` | `videos/traffic1.mp4` | Path file video |
+| `VIDEO_LOOP` | `True` | Loop video atau berhenti di akhir |
+| `ESP32_URL` | `http://...` | Alamat IP stream ESP32-CAM |
+| `CONFIDENCE` | `0.35` | Threshold deteksi (jangan di bawah 0.30) |
+| `COUNT_DIRECTION` | `"down"` | `"down"`, `"up"`, atau `"both"` |
+| `LINE_Y` | otomatis | 65% tinggi frame, tidak perlu diubah manual |
+
+---
+
+## Cara Pakai
+
+**Mode VIDEO:**
+```python
+SOURCE_MODE = "VIDEO"
+VIDEO_PATH  = "videos/traffic1.mp4"
+VIDEO_LOOP  = True    # True = loop, False = hentikan saat habis
 ```
-We have replaced the appearance descriptor with a custom deep convolutional
-neural network (see below).
 
-## Running the tracker
-
-The following example starts the tracker on one of the
-[MOT16 benchmark](https://motchallenge.net/data/MOT16/)
-sequences.
-We assume resources have been extracted to the repository root directory and
-the MOT16 benchmark data is in `./MOT16`:
+**Mode ESP32-CAM:**
+```python
+SOURCE_MODE = "ESP32-CAM"
+ESP32_URL   = "http://192.168.x.x:81/stream"   # ganti IP sesuai ESP32
 ```
-python deep_sort_app.py \
-    --sequence_dir=./MOT16/test/MOT16-06 \
-    --detection_file=./resources/detections/MOT16_POI_test/MOT16-06.npy \
-    --min_confidence=0.3 \
-    --nn_budget=100 \
-    --display=True
+
+**Jalankan:**
+```bash
+python vehicle_counting.py
 ```
-Check `python deep_sort_app.py -h` for an overview of available options.
-There are also scripts in the repository to visualize results, generate videos,
-and evaluate the MOT challenge benchmark.
 
-## Generating detections
+---
 
-Beside the main tracking application, this repository contains a script to
-generate features for person re-identification, suitable to compare the visual
-appearance of pedestrian bounding boxes using cosine similarity.
-The following example generates these features from standard MOT challenge
-detections. Again, we assume resources have been extracted to the repository
-root directory and MOT16 data is in `./MOT16`:
+## Kontrol Keyboard
+
+| Tombol | Fungsi |
+|--------|--------|
+| `Q` | Keluar & simpan report |
+| `S` | Cetak statistik ke terminal |
+| `R` | Reset semua hitungan |
+| `L` | Tampilkan / sembunyikan garis ROI |
+
+---
+
+## Tips ESP32-CAM
+
+1. Set resolusi ke **VGA (640×480)** di firmware ESP32 — jangan UXGA/SVGA,
+   terlalu berat untuk streaming WiFi.
+2. Pastikan ESP32 dan laptop/PC di **jaringan WiFi yang sama**.
+3. Kalau gambar sering freeze, perkecil `FRAME_RATE` di sketch Arduino.
+4. Sinar di belakang kendaraan (backlight) menurunkan akurasi —
+   tempatkan kamera menghadap sumber cahaya jika memungkinkan.
+
+---
+
+## Struktur Folder
+
 ```
-python tools/generate_detections.py \
-    --model=resources/networks/mars-small128.pb \
-    --mot_dir=./MOT16/train \
-    --output_dir=./resources/detections/MOT16_train
+project/
+├── vehicle_counting.py   ← file utama
+├── utils.py              ← helper functions
+├── bytetrack_temp.yaml   ← config tracker (disiapkan untuk upgrade)
+├── requirements.txt
+├── yolov8n.pt            ← model YOLO
+├── videos/
+│   └── traffic1.mp4
+└── outputs/
+    ├── reports/          ← report .txt tersimpan di sini
+    └── results/          ← output video (jika aktifkan writer)
 ```
-The model has been generated with TensorFlow 1.5. If you run into
-incompatibility, re-export the frozen inference graph to obtain a new
-`mars-small128.pb` that is compatible with your version:
-```
-python tools/freeze_model.py
-```
-The ``generate_detections.py`` stores for each sequence of the MOT16 dataset
-a separate binary file in NumPy native format. Each file contains an array of
-shape `Nx138`, where N is the number of detections in the corresponding MOT
-sequence. The first 10 columns of this array contain the raw MOT detection
-copied over from the input file. The remaining 128 columns store the appearance
-descriptor. The files generated by this command can be used as input for the
-`deep_sort_app.py`.
 
-**NOTE**: If ``python tools/generate_detections.py`` raises a TensorFlow error,
-try passing an absolute path to the ``--model`` argument. This might help in
-some cases.
+---
 
-## Training the model
+## Teknologi
 
-To train the deep association metric model we used a novel [cosine metric learning](https://github.com/nwojke/cosine_metric_learning) approach which is provided as a separate repository.
-
-## Highlevel overview of source files
-
-In the top-level directory are executable scripts to execute, evaluate, and
-visualize the tracker. The main entry point is in `deep_sort_app.py`.
-This file runs the tracker on a MOTChallenge sequence.
-
-In package `deep_sort` is the main tracking code:
-
-* `detection.py`: Detection base class.
-* `kalman_filter.py`: A Kalman filter implementation and concrete
-   parametrization for image space filtering.
-* `linear_assignment.py`: This module contains code for min cost matching and
-   the matching cascade.
-* `iou_matching.py`: This module contains the IOU matching metric.
-* `nn_matching.py`: A module for a nearest neighbor matching metric.
-* `track.py`: The track class contains single-target track data such as Kalman
-  state, number of hits, misses, hit streak, associated feature vectors, etc.
-* `tracker.py`: This is the multi-target tracker class.
-
-The `deep_sort_app.py` expects detections in a custom format, stored in .npy
-files. These can be computed from MOTChallenge detections using
-`generate_detections.py`. We also provide
-[pre-generated detections](https://drive.google.com/open?id=1VVqtL0klSUvLnmBKS89il1EKC3IxUBVK).
-
-## Citing DeepSORT
-
-If you find this repo useful in your research, please consider citing the following papers:
-
-    @inproceedings{Wojke2017simple,
-      title={Simple Online and Realtime Tracking with a Deep Association Metric},
-      author={Wojke, Nicolai and Bewley, Alex and Paulus, Dietrich},
-      booktitle={2017 IEEE International Conference on Image Processing (ICIP)},
-      year={2017},
-      pages={3645--3649},
-      organization={IEEE},
-      doi={10.1109/ICIP.2017.8296962}
-    }
-
-    @inproceedings{Wojke2018deep,
-      title={Deep Cosine Metric Learning for Person Re-identification},
-      author={Wojke, Nicolai and Bewley, Alex},
-      booktitle={2018 IEEE Winter Conference on Applications of Computer Vision (WACV)},
-      year={2018},
-      pages={748--756},
-      organization={IEEE},
-      doi={10.1109/WACV.2018.00087}
-    }
+- Python 3.10+
+- [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics)
+- OpenCV
+- NumPy
+- ESP32-CAM (AI Thinker / TTGO T-Journal)
