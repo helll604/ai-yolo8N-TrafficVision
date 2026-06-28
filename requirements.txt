@@ -10,6 +10,10 @@ numpy
 # ── Konfigurasi ───────────────────────────────
 pyyaml
 
+# ── Komunikasi ────────────────────────────────
+requests
+paho-mqtt
+
 # ── CATATAN ───────────────────────────────────
 # filterpy, scipy, lap  DIHAPUS — paket DeepSORT yang tidak dipakai.
 # Kalau di masa depan ingin aktifkan DeepSORT, install kembali:
