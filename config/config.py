@@ -1,17 +1,17 @@
 # ============================================================
-# 1. KONFIGURASI
+#  KONFIGURASI
 # ============================================================
 
 # ===== PILIH SALAH SATU =====
-SOURCE_MODE = "VIDEO"         # mode video file
-# SOURCE_MODE = "ESP32-CAM"   # mode ESP32-CAM
+#SOURCE_MODE = "VIDEO"         # mode video file
+SOURCE_MODE = "ESP32-CAM"   # mode ESP32-CAM
 
 # Konfigurasi Video
-VIDEO_PATH  = "videos/traffic5.mp4"
+VIDEO_PATH  = "videos/traffic8.mp4"
 VIDEO_LOOP  = True
 
 # Konfigurasi ESP32-CAM
-ESP32_URL         = "http://10.136.172.178:81/stream"
+ESP32_URL         = "http://10.136.172.178:/stream"
 ESP32_TIMEOUT     = 10
 ESP32_RECONNECT_S = 3
 
@@ -23,9 +23,20 @@ IMGSZ      = 640
 CONFIRM_FRAMES = 3
 MAX_TRACK_AGE  = 50
 
-# Threshold Kemacetan
-CONGESTION_THRESHOLD = 10
-TOTAL_CONGESTION     = 15
+# ============================================================
+# KONFIGURASI STATUS LALU LINTAS
+# ============================================================
+# Threshold MACET
+CONGESTION_THRESHOLD = 10      # Per jenis kendaraan (misal: jika mobil > 10 = macet)
+TOTAL_CONGESTION     = 15      # Total semua kendaraan (misal: jika total > 15 = macet)
+
+# Threshold PADAT (persentase dari threshold macet)
+PADAT_THRESHOLD_PERCENT = 0.5  # 50% dari TOTAL_CONGESTION
+# Berarti padat jika total >= 7.5 (dibulatkan ke 8)
+# Status: 
+# - LANCAR: total < 8
+# - PADAT: 8 <= total < 15
+# - MACET: total >= 15
 
 VEHICLE_CLASSES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 VEHICLE_COLORS  = {
